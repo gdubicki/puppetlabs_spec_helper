@@ -4,6 +4,7 @@ require 'rspec/core/rake_task'
 require 'tmpdir'
 require 'yaml'
 require 'pathname'
+require 'open-uri'
 
 # optional gems
 begin
@@ -64,6 +65,20 @@ def repositories
     end
   end
   @repositories
+end
+
+# cache the forge modules
+def forge_modules
+  unless @forge_modules
+    @forge_modules = fixtures('forge_modules')
+    @forge_modules.each do |remote, opts|
+      if opts.instance_of?(String)
+        # TODO: this case is not really supported yet...
+        @forge_modules[remote] = {"target" => opts} # inject a hash
+      end
+    end
+  end
+  @forge_modules
 end
 
 # get the array of Beaker set names
@@ -136,7 +151,9 @@ def fixtures(category)
       elsif opts.instance_of?(Hash)
         target = "spec/fixtures/modules/#{fixture}"
         real_source = eval('"'+opts["repo"]+'"')
-        result[real_source] = { "target" => target, "ref" => opts["ref"], "branch" => opts["branch"], "scm" => opts["scm"], "flags" => opts["flags"], "subdir" => opts["subdir"]}
+        result[real_source] = { "target" => target, "ref" => opts["ref"], "branch" => opts["branch"],
+                                "scm" => opts["scm"], "flags" => opts["flags"], "subdir" => opts["subdir"],
+                                "repo" => opts["repo"], "name" => fixture}
       end
     end
   end
@@ -304,31 +321,60 @@ task :spec_prep do
     end
   end
 
-  fixtures("forge_modules").each do |remote, opts|
-    ref = ""
-    flags = ""
-    if opts.instance_of?(String)
-      target = opts
-    elsif opts.instance_of?(Hash)
-      target = opts["target"]
-      ref = " --version #{opts['ref']}" if not opts['ref'].nil?
-      flags = " #{opts['flags']}" if opts['flags']
-    end
-    next if File::exists?(target)
+  forge_modules.each do |remote, opts|
+    name = opts["name"]
+    # TODO: add support for lack of "ref". use puppetforge API to get the URL in that case
+    # see https://forgeapi.puppetlabs.com
+    ref = opts["ref"]
+    name_with_dash = opts["repo"].gsub('/', '-')
 
-    working_dir = module_working_directory
     target_dir = File.expand_path('spec/fixtures/modules')
 
-    command = "puppet module install" + ref + flags + \
-      " --ignore-dependencies" \
-      " --force" \
-      " --module_working_dir \"#{working_dir}\"" \
-      " --target-dir \"#{target_dir}\" \"#{remote}\""
+    next if File::exists?(target_dir + "/" + name)
 
-    unless system(command)
-      fail "Failed to install module #{remote} to #{target_dir}"
+    # get the current active threads that are alive
+    count = current_thread_count(forge_modules)
+    if count < max_thread_limit
+      logger.debug "New Thread started for #{remote}"
+      # start up a new thread and store it in the opts hash
+      opts[:thread] = Thread.new do
+
+        begin
+          Dir.mkdir(target_dir + "/" + name)
+
+          dir = Dir.mktmpdir("forge_module-" + name)
+
+          filename = name_with_dash + "-" + ref + ".tar.gz"
+          path_and_filename = dir + "/" + filename
+
+          download = open("https://forge.puppet.com/v3/files/" + filename)
+          IO.copy_stream(download, path_and_filename)
+
+          tar_output = `tar xz --strip-components=1 -C #{target_dir}/#{name} -f #{path_and_filename} 2>&1`
+          if not $?.success?
+            fail "Failed to ungzip / untar forge module '#{remote}' ref '#{ref}' to #{target_dir}," \
+               + " stdout / stderr : '#{tar_output}'"
+          end
+        rescue Exception => msg
+          fail "Failed to download forge module '#{remote}' ref '#{ref}' to #{target_dir}," \
+               + " exception: '#{msg}'"
+        ensure
+          FileUtils.remove_entry_secure dir
+        end
+
+      end
+    else
+      # the last thread started should be the longest wait
+      item, item_opts = forge_modules.find_all {|i,o| o.has_key?(:thread)}.last
+      logger.debug "Waiting on #{item}"
+      item_opts[:thread].join  # wait for the thread to finish
+      # now that we waited lets try again
+      redo
     end
   end
+
+  # wait for all the threads to finish
+  forge_modules.each {|remote, opts| opts[:thread].join }
 
   FileUtils::mkdir_p("spec/fixtures/manifests")
   FileUtils::touch("spec/fixtures/manifests/site.pp")
