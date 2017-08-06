@@ -172,6 +172,7 @@ def clone_repo(scm, remote, target, subdir=nil, ref=nil, branch=nil, flags = nil
     args.push('clone')
     args.push('--depth 1') unless ref
     args.push('-b', branch) if branch
+    args.push('--single-branch') if branch
     args.push(flags) if flags
     args.push(remote, target)
   else
